@@ -1,0 +1,681 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ASHBOUND: The Hero You Fear</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#05030a;font-family:'Trebuchet MS',system-ui,sans-serif;}
+  canvas{display:block;cursor:crosshair;}
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+(() => {
+'use strict';
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+let W = 0, H = 0;
+function resize(){ W = canvas.width = innerWidth; H = canvas.height = innerHeight; }
+addEventListener('resize', resize); resize();
+
+const keys = Object.create(null);
+const mouse = { x: 0, y: 0, down: false };
+
+addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  keys[k] = true;
+  if ([' ','arrowup','arrowdown','arrowleft','arrowright'].includes(k)) e.preventDefault();
+  if (k === 'enter' && game.state === 'menu') startGame();
+  if (k === 'r' && (game.state === 'gameover' || game.state === 'win')) startGame();
+});
+addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
+canvas.addEventListener('mousemove', e => { mouse.x = e.clientX; mouse.y = e.clientY; });
+canvas.addEventListener('mousedown', e => {
+  e.preventDefault();
+  if (game.state === 'menu' || game.state === 'gameover' || game.state === 'win') startGame();
+  mouse.down = true;
+});
+addEventListener('mouseup', () => { mouse.down = false; });
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+const rand = (a,b) => a + Math.random()*(b-a);
+const clamp = (v,a,b) => v < a ? a : v > b ? b : v;
+const TAU = Math.PI*2;
+function angDiff(a,b){ let d = (a-b) % TAU; if (d > Math.PI) d -= TAU; if (d < -Math.PI) d += TAU; return d; }
+function dist2(a,b){ return Math.hypot(a.x-b.x, a.y-b.y); }
+
+const WAVES = [
+  { count: 8,  interval: 1.0, speed: 95,  hp: 26 },
+  { count: 12, interval: 0.8, speed: 110, hp: 34 },
+  { count: 16, interval: 0.6, speed: 128, hp: 42 },
+];
+
+const game = {
+  state: 'menu', time: 0, wave: 0,
+  waveEnemiesLeft: 0, spawnTimer: 0, waveClearTimer: 0,
+  score: 0, shake: 0, message: '', messageTimer: 0,
+  enemies: [], particles: [], radiant: null,
+};
+
+const player = {
+  x: 0, y: 0, r: 16, speed: 235,
+  hp: 100, maxHp: 100,
+  fear: 0, maxFear: 100,
+  facing: 0, attackCd: 0, attackTimer: 0,
+  dashCd: 0, dashTimer: 0, dashDir: { x:1, y:0 },
+  invuln: 0, hurtFlash: 0, lastFearGain: -99,
+};
+
+function flash(msg, t){ game.message = msg; game.messageTimer = t; }
+
+function addFear(n){
+  player.fear = Math.min(player.maxFear, player.fear + n);
+  player.lastFearGain = game.time;
+}
+
+function startGame(){
+  player.x = W/2; player.y = H/2;
+  player.hp = player.maxHp;
+  player.fear = 0;
+  player.attackCd = 0; player.attackTimer = 0;
+  player.dashCd = 0; player.dashTimer = 0;
+  player.invuln = 0; player.hurtFlash = 0;
+  player.lastFearGain = -99;
+  game.state = 'playing'; game.time = 0; game.score = 0;
+  game.enemies.length = 0; game.particles.length = 0;
+  game.radiant = null; game.shake = 0; game.waveClearTimer = 0;
+  startWave(1);
+}
+
+function startWave(n){
+  game.wave = n;
+  game.waveEnemiesLeft = WAVES[n-1].count;
+  game.spawnTimer = 1.0;
+  game.waveClearTimer = 0;
+  flash('WAVE ' + n, 2.0);
+}
+
+function spawnEnemy(){
+  const cfg = WAVES[game.wave - 1];
+  const side = Math.floor(Math.random()*4), m = 70;
+  let x, y;
+  if (side === 0) { x = rand(0,W); y = -m; }
+  else if (side === 1) { x = W+m; y = rand(0,H); }
+  else if (side === 2) { x = rand(0,W); y = H+m; }
+  else { x = -m; y = rand(0,H); }
+  game.enemies.push({
+    x, y, r: 14,
+    speed: cfg.speed + rand(-15,20),
+    hp: cfg.hp, maxHp: cfg.hp,
+    hurt: 0, atkCd: 0, knockX: 0, knockY: 0,
+  });
+}
+
+function spawnRadiant(){
+  const a = Math.random()*TAU;
+  const d = Math.min(W,H)*0.55;
+  game.radiant = {
+    x: clamp(player.x + Math.cos(a)*d, 40, W-40),
+    y: clamp(player.y + Math.sin(a)*d, 40, H-40),
+    r: 30, hp: 100, maxHp: 100, hurt: 0, atkCd: 0,
+  };
+  flash('THE RADIANT ONE HAS COME', 2.5);
+  game.shake = 22;
+  spawnParticles(game.radiant.x, game.radiant.y, 40, '#ffd166');
+}
+
+function banishRadiant(){
+  const R = game.radiant;
+  spawnParticles(R.x, R.y, 70, '#ffe89a');
+  player.fear = 0;
+  player.lastFearGain = game.time;
+  game.score += 600;
+  player.hp = Math.min(player.maxHp, player.hp + 25);
+  game.radiant = null;
+  game.shake = 26;
+  flash('THE RADIANT ONE IS BANISHED', 2.6);
+}
+
+function damagePlayer(n){
+  if (player.invuln > 0) return;
+  player.hp -= n;
+  player.invuln = 0.55;
+  player.hurtFlash = 0.35;
+  addFear(7);
+  game.shake = Math.max(game.shake, 10);
+  spawnParticles(player.x, player.y, 10, '#ff2d55');
+  if (player.hp <= 0) {
+    player.hp = 0;
+    game.state = 'gameover';
+    game.radiant = null;
+  }
+}
+
+function doAttack(){
+  player.attackCd = 0.36;
+  player.attackTimer = 0.2;
+  const range = 82, half = Math.PI * 0.5;
+  let hitAny = false;
+
+  for (const e of game.enemies) {
+    const d = dist2(e, player);
+    if (d > range + e.r) continue;
+    const a = Math.atan2(e.y - player.y, e.x - player.x);
+    if (Math.abs(angDiff(a, player.facing)) > half) continue;
+    e.hp -= 24;
+    e.hurt = 0.15;
+    e.knockX = Math.cos(a) * 320;
+    e.knockY = Math.sin(a) * 320;
+    spawnParticles(e.x, e.y, 7, '#ff3b5c');
+    hitAny = true;
+  }
+
+  const R = game.radiant;
+  if (R) {
+    const d = dist2(R, player);
+    const a = Math.atan2(R.y - player.y, R.x - player.x);
+    if (d < range + R.r && Math.abs(angDiff(a, player.facing)) < half) {
+      if (player.fear >= 40) {
+        spawnParticles(R.x, R.y, 10, '#ffd166');
+        flash('FEAR SHIELDS THE RADIANT ONE', 1.1);
+        game.shake = Math.max(game.shake, 6);
+      } else {
+        R.hp -= 20 + (40 - player.fear) * 0.9;
+        R.hurt = 0.18;
+        spawnParticles(R.x, R.y, 14, '#fff2b0');
+        game.shake = Math.max(game.shake, 7);
+        hitAny = true;
+      }
+    }
+  }
+  if (hitAny) game.shake = Math.max(game.shake, 3);
+}
+
+function spawnParticles(x, y, n, color){
+  for (let i = 0; i < n; i++) {
+    const a = Math.random()*TAU, s = rand(60,420);
+    game.particles.push({
+      x, y, vx: Math.cos(a)*s, vy: Math.sin(a)*s,
+      life: rand(0.3,0.8), maxLife: 0.8, color, size: rand(1.5,3.5),
+    });
+  }
+}
+
+function updateParticles(dt){
+  const p = game.particles;
+  for (let i = p.length-1; i >= 0; i--) {
+    const q = p[i];
+    q.life -= dt;
+    if (q.life <= 0) { p.splice(i,1); continue; }
+    q.x += q.vx*dt; q.y += q.vy*dt;
+    q.vx *= 0.94; q.vy *= 0.94;
+  }
+}
+
+function updatePlayer(dt){
+  player.attackCd = Math.max(0, player.attackCd - dt);
+  player.attackTimer = Math.max(0, player.attackTimer - dt);
+  player.dashCd = Math.max(0, player.dashCd - dt);
+  player.invuln = Math.max(0, player.invuln - dt);
+  player.hurtFlash = Math.max(0, player.hurtFlash - dt);
+
+  let dx = 0, dy = 0;
+  if (keys['a'] || keys['arrowleft']) dx--;
+  if (keys['d'] || keys['arrowright']) dx++;
+  if (keys['w'] || keys['arrowup']) dy--;
+  if (keys['s'] || keys['arrowdown']) dy++;
+  const len = Math.hypot(dx,dy);
+  if (len > 0) { dx /= len; dy /= len; }
+
+  if (keys['shift'] && player.dashCd <= 0 && len > 0) {
+    player.dashTimer = 0.16;
+    player.dashCd = 0.85;
+    player.dashDir = { x: dx, y: dy };
+    player.invuln = Math.max(player.invuln, 0.28);
+    game.shake = Math.max(game.shake, 4);
+    spawnParticles(player.x, player.y, 8, '#7fd4ff');
+  }
+
+  if (player.dashTimer > 0) {
+    player.dashTimer -= dt;
+    player.x += player.dashDir.x * 900 * dt;
+    player.y += player.dashDir.y * 900 * dt;
+  } else {
+    player.x += dx * player.speed * dt;
+    player.y += dy * player.speed * dt;
+  }
+  player.x = clamp(player.x, player.r, W - player.r);
+  player.y = clamp(player.y, player.r, H - player.r);
+  player.facing = Math.atan2(mouse.y - player.y, mouse.x - player.x);
+
+  if ((mouse.down || keys[' '] || keys['j']) && player.attackCd <= 0) doAttack();
+
+  if (game.time - player.lastFearGain > 1.2) {
+    player.fear = Math.max(0, player.fear - 7 * dt);
+  }
+
+  if (!game.radiant && player.fear >= 60) spawnRadiant();
+}
+
+function updateEnemies(dt){
+  const arr = game.enemies;
+  for (let i = arr.length-1; i >= 0; i--) {
+    const e = arr[i];
+    e.hurt = Math.max(0, e.hurt - dt);
+    e.atkCd = Math.max(0, e.atkCd - dt);
+
+    const ang = Math.atan2(player.y - e.y, player.x - e.x);
+    e.x += Math.cos(ang) * e.speed * dt;
+    e.y += Math.sin(ang) * e.speed * dt;
+
+    if (e.knockX || e.knockY) {
+      e.x += e.knockX * dt;
+      e.y += e.knockY * dt;
+      e.knockX *= 0.86; e.knockY *= 0.86;
+      if (Math.abs(e.knockX) < 5) { e.knockX = 0; e.knockY = 0; }
+    }
+
+    if (dist2(e, player) < e.r + player.r && e.atkCd <= 0) {
+      if (player.invuln <= 0) {
+        damagePlayer(9);
+        e.atkCd = 1.0;
+      }
+    }
+
+    if (e.hp <= 0) {
+      arr.splice(i,1);
+      game.score += 60;
+      addFear(9);
+      spawnParticles(e.x, e.y, 16, '#ff3b5c');
+      game.shake = Math.max(game.shake, 4);
+    }
+  }
+
+  for (let i = 0; i < arr.length; i++) {
+    for (let j = i+1; j < arr.length; j++) {
+      const a = arr[i], b = arr[j];
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const d = Math.hypot(dx,dy) || 1;
+      const min = a.r + b.r;
+      if (d < min) {
+        const push = (min - d) / 2, ux = dx/d, uy = dy/d;
+        a.x -= ux*push; a.y -= uy*push;
+        b.x += ux*push; b.y += uy*push;
+      }
+    }
+  }
+}
+
+function updateRadiant(dt){
+  const R = game.radiant;
+  if (!R) return;
+  R.hurt = Math.max(0, R.hurt - dt);
+  R.atkCd = Math.max(0, R.atkCd - dt);
+
+  const ang = Math.atan2(player.y - R.y, player.x - R.x);
+  const spd = 110 + player.fear * 1.3;
+  R.x += Math.cos(ang) * spd * dt;
+  R.y += Math.sin(ang) * spd * dt;
+
+  if (dist2(R, player) < R.r + player.r && R.atkCd <= 0) {
+    if (player.invuln <= 0) {
+      damagePlayer(16);
+      R.atkCd = 0.9;
+      game.shake = Math.max(game.shake, 12);
+    }
+  }
+  if (R.hp <= 0) banishRadiant();
+}
+
+function updateWaves(dt){
+  if (game.waveEnemiesLeft > 0) {
+    game.spawnTimer -= dt;
+    if (game.spawnTimer <= 0) {
+      spawnEnemy();
+      game.waveEnemiesLeft--;
+      game.spawnTimer = WAVES[game.wave-1].interval;
+    }
+    return;
+  }
+  if (game.enemies.length > 0) { game.waveClearTimer = 0; return; }
+
+  if (game.wave >= WAVES.length) {
+    if (!game.radiant) game.state = 'win';
+    return;
+  }
+
+  if (game.waveClearTimer <= 0) {
+    game.waveClearTimer = 2.5;
+    flash('WAVE CLEARED', 1.6);
+  }
+  game.waveClearTimer -= dt;
+  if (game.waveClearTimer <= 0) startWave(game.wave + 1);
+}
+
+function update(dt){
+  game.time += dt;
+  game.shake = Math.max(0, game.shake - game.shake*8*dt);
+  if (game.messageTimer > 0) game.messageTimer -= dt;
+  updateParticles(dt);
+  if (game.state !== 'playing') return;
+  updatePlayer(dt);
+  updateEnemies(dt);
+  updateRadiant(dt);
+  updateWaves(dt);
+}
+
+/* ---------- RENDER ---------- */
+
+function drawBackground(){
+  const g = ctx.createRadialGradient(W*0.5,H*0.5,0,W*0.5,H*0.5,Math.max(W,H)*0.75);
+  g.addColorStop(0,'#191024'); g.addColorStop(0.55,'#0d0716'); g.addColorStop(1,'#05030a');
+  ctx.fillStyle = g;
+  ctx.fillRect(-60,-60,W+120,H+120);
+
+  ctx.strokeStyle = 'rgba(120,80,160,0.07)';
+  ctx.lineWidth = 1;
+  const step = 64, ox = (game.time*6) % step;
+  ctx.beginPath();
+  for (let x = -step + ox; x < W + step; x += step) { ctx.moveTo(x,0); ctx.lineTo(x,H); }
+  for (let y = 0; y < H + step; y += step) { ctx.moveTo(0,y); ctx.lineTo(W,y); }
+  ctx.stroke();
+}
+
+function drawPlayer(){
+  const p = player;
+  ctx.save();
+  ctx.translate(p.x, p.y);
+
+  ctx.beginPath();
+  ctx.ellipse(0, 8, 20, 8, 0, 0, TAU);
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  ctx.fill();
+
+  if (p.fear > 5) {
+    const a = (p.fear/p.maxFear)*0.5;
+    const rg = ctx.createRadialGradient(0,0,4,0,0,46);
+    rg.addColorStop(0, 'rgba(255,40,80,'+(a*0.7)+')');
+    rg.addColorStop(1, 'rgba(255,40,80,0)');
+    ctx.fillStyle = rg;
+    ctx.beginPath(); ctx.arc(0,0,46,0,TAU); ctx.fill();
+  }
+
+  ctx.beginPath();
+  ctx.arc(0,0,p.r,0,TAU);
+  ctx.fillStyle = p.hurtFlash > 0 ? '#ff6b81' : '#1c1220';
+  ctx.fill();
+  ctx.lineWidth = 2.5;
+  ctx.strokeStyle = p.invuln > 0 ? '#7fd4ff' : '#ff2d55';
+  ctx.stroke();
+
+  ctx.rotate(p.facing);
+  ctx.beginPath();
+  ctx.moveTo(8,0); ctx.lineTo(34,-4); ctx.lineTo(34,4);
+  ctx.closePath();
+  ctx.fillStyle = '#e8e0ff';
+  ctx.fill();
+
+  if (p.attackTimer > 0) {
+    const t = p.attackTimer/0.2;
+    ctx.beginPath();
+    ctx.arc(0,0,82,-Math.PI*0.5,Math.PI*0.5);
+    ctx.strokeStyle = 'rgba(255,120,180,'+t+')';
+    ctx.lineWidth = 8;
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawEnemies(){
+  for (const e of game.enemies) {
+    ctx.save();
+    ctx.translate(e.x, e.y);
+    ctx.beginPath();
+    ctx.ellipse(0,6,14,6,0,0,TAU);
+    ctx.fillStyle = 'rgba(0,0,0,0.45)';
+    ctx.fill();
+
+    ctx.beginPath();
+    ctx.arc(0,0,e.r,0,TAU);
+    ctx.fillStyle = e.hurt > 0 ? '#ffd0d8' : '#3a1420';
+    ctx.fill();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = '#8c1f3a';
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.arc(-5,-3,2.2,0,TAU);
+    ctx.arc(5,-3,2.2,0,TAU);
+    ctx.fillStyle = '#ff3355';
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+function drawRadiant(){
+  const R = game.radiant;
+  if (!R) return;
+  const shielded = player.fear >= 40;
+  const pulse = 1 + Math.sin(game.time*6)*0.04;
+
+  ctx.save();
+  ctx.translate(R.x, R.y);
+
+  const glow = ctx.createRadialGradient(0,0,6,0,0,90*pulse);
+  glow.addColorStop(0, shielded ? 'rgba(255,225,140,0.55)' : 'rgba(255,225,140,0.35)');
+  glow.addColorStop(1, 'rgba(255,200,80,0)');
+  ctx.fillStyle = glow;
+  ctx.beginPath(); ctx.arc(0,0,90*pulse,0,TAU); ctx.fill();
+
+  ctx.save();
+  ctx.rotate(game.time*1.2);
+  ctx.beginPath();
+  ctx.arc(0,0,46,0,TAU);
+  ctx.setLineDash([10,12]);
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = 'rgba(255,215,110,0.75)';
+  ctx.stroke();
+  ctx.restore();
+
+  ctx.beginPath();
+  ctx.arc(0,0,R.r,0,TAU);
+  const bg = ctx.createRadialGradient(0,-8,4,0,0,R.r);
+  bg.addColorStop(0, R.hurt > 0 ? '#ffffff' : '#fff3c4');
+  bg.addColorStop(1, '#c99a2e');
+  ctx.fillStyle = bg;
+  ctx.fill();
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = shielded ? '#fffbe0' : '#8a6a14';
+  ctx.stroke();
+
+  const a = Math.atan2(player.y - R.y, player.x - R.x);
+  ctx.rotate(a);
+  ctx.beginPath();
+  ctx.moveTo(R.r-4,-5); ctx.lineTo(R.r+42,0); ctx.lineTo(R.r-4,5);
+  ctx.closePath();
+  ctx.fillStyle = shielded ? '#fffbe0' : '#d8b450';
+  ctx.fill();
+  ctx.restore();
+
+  const w = 70, h = 6, bx = R.x - w/2, by = R.y - R.r - 22;
+  ctx.fillStyle = 'rgba(0,0,0,0.6)';
+  ctx.fillRect(bx,by,w,h);
+  ctx.fillStyle = shielded ? '#fff3c4' : '#ffcc44';
+  ctx.fillRect(bx,by,w*clamp(R.hp/R.maxHp,0,1),h);
+
+  if (shielded) {
+    ctx.fillStyle = 'rgba(255,255,220,0.9)';
+    ctx.font = 'bold 10px system-ui';
+    ctx.textAlign = 'center';
+    ctx.fillText('SHIELDED BY FEAR', R.x, by - 6);
+  }
+}
+
+function drawParticles(){
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  for (const p of game.particles) {
+    ctx.globalAlpha = clamp(p.life/p.maxLife, 0, 1);
+    ctx.fillStyle = p.color;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.size, 0, TAU);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+function drawHUD(){
+  if (game.state === 'menu') return;
+  const pad = 24;
+
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  ctx.fillRect(pad,pad,260,16);
+  ctx.fillStyle = '#ff2d55';
+  ctx.fillRect(pad,pad,260*(player.hp/player.maxHp),16);
+  ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(pad+0.5,pad+0.5,260,16);
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 11px system-ui';
+  ctx.textAlign = 'left';
+  ctx.fillText('HEALTH', pad, pad-6);
+
+  const fy = pad + 30;
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  ctx.fillRect(pad,fy,260,12);
+  ctx.fillStyle = '#b56cff';
+  ctx.fillRect(pad,fy,260*(player.fear/player.maxFear),12);
+  ctx.fillStyle = 'rgba(255,255,255,0.75)';
+  ctx.fillRect(pad + 260*0.4, fy-3, 2, 18);
+  ctx.fillStyle = '#e6d4ff';
+  ctx.fillText('FEAR', pad, fy-4);
+
+  ctx.textAlign = 'right';
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 18px system-ui';
+  ctx.fillText('WAVE ' + game.wave + ' / ' + WAVES.length, W-pad, pad+8);
+  ctx.font = 'bold 14px system-ui';
+  ctx.fillStyle = '#b9a8d0';
+  ctx.fillText('SCORE ' + game.score, W-pad, pad+30);
+
+  if (game.messageTimer > 0) {
+    ctx.globalAlpha = Math.min(1, game.messageTimer);
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 30px system-ui';
+    ctx.fillStyle = '#ffe89a';
+    ctx.shadowColor = '#ff9a3c';
+    ctx.shadowBlur = 24;
+    ctx.fillText(game.message, W/2, H*0.22);
+    ctx.shadowBlur = 0;
+    ctx.globalAlpha = 1;
+  }
+}
+
+function drawOverlay(){
+  if (game.state === 'playing') return;
+  ctx.fillStyle = 'rgba(3,2,8,0.78)';
+  ctx.fillRect(0,0,W,H);
+  ctx.textAlign = 'center';
+
+  if (game.state === 'menu') {
+    ctx.fillStyle = '#ffe89a';
+    ctx.font = 'bold 54px system-ui';
+    ctx.shadowColor = '#ff3b5c'; ctx.shadowBlur = 30;
+    ctx.fillText('ASHBOUND', W/2, H*0.36);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = '#e8dcf5';
+    ctx.font = 'italic 22px system-ui';
+    ctx.fillText('The Hero You Fear', W/2, H*0.42);
+
+    ctx.fillStyle = '#b9a8d0';
+    ctx.font = '16px system-ui';
+    ctx.fillText('WASD / Arrows — move     Mouse — aim     Click or Space — strike', W/2, H*0.56);
+    ctx.fillText('Shift — dash (dodge)', W/2, H*0.605);
+
+    ctx.fillStyle = '#ff8fa3';
+    ctx.font = 'bold 16px system-ui';
+    ctx.fillText('Kill to build FEAR. Fear empowers you — and summons the Radiant One.', W/2, H*0.68);
+    ctx.fillStyle = '#8fd8ff';
+    ctx.fillText('Drop your fear below 40% to break its shield and banish it.', W/2, H*0.72);
+
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 20px system-ui';
+    ctx.globalAlpha = 0.6 + Math.sin(game.time*3)*0.4;
+    ctx.fillText('CLICK OR PRESS ENTER TO BEGIN', W/2, H*0.85);
+    ctx.globalAlpha = 1;
+  }
+
+  if (game.state === 'gameover') {
+    ctx.fillStyle = '#ff3b5c';
+    ctx.font = 'bold 56px system-ui';
+    ctx.fillText('YOU FELL', W/2, H*0.42);
+    ctx.fillStyle = '#e8dcf5';
+    ctx.font = '20px system-ui';
+    ctx.fillText('The Radiant One claimed what was left of you.', W/2, H*0.50);
+    ctx.fillStyle = '#ffe89a';
+    ctx.font = 'bold 24px system-ui';
+    ctx.fillText('SCORE ' + game.score, W/2, H*0.60);
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 18px system-ui';
+    ctx.fillText('PRESS R TO RISE AGAIN', W/2, H*0.72);
+  }
+
+  if (game.state === 'win') {
+    ctx.fillStyle = '#ffe89a';
+    ctx.font = 'bold 52px system-ui';
+    ctx.shadowColor = '#ff9a3c'; ctx.shadowBlur = 28;
+    ctx.fillText('THE CITADEL BURNS', W/2, H*0.40);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = '#e8dcf5';
+    ctx.font = '20px system-ui';
+    ctx.fillText('You became the villain. You faced the hero you feared.', W/2, H*0.49);
+    ctx.fillStyle = '#ff8fa3';
+    ctx.font = 'bold 22px system-ui';
+    ctx.fillText('FINAL SCORE ' + game.score, W/2, H*0.59);
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 18px system-ui';
+    ctx.fillText('PRESS R TO PLAY AGAIN', W/2, H*0.72);
+  }
+}
+
+function render(){
+  ctx.setTransform(1,0,0,1,0,0);
+  ctx.fillStyle = '#05030a';
+  ctx.fillRect(0,0,W,H);
+
+  const sx = (Math.random()-0.5)*game.shake;
+  const sy = (Math.random()-0.5)*game.shake;
+  ctx.save();
+  ctx.translate(sx, sy);
+
+  drawBackground();
+
+  if (game.state !== 'menu') {
+    drawEnemies();
+    drawRadiant();
+    if (game.state !== 'gameover') drawPlayer();
+    drawParticles();
+  }
+
+  ctx.restore();
+  drawHUD();
+  drawOverlay();
+}
+
+let lastT = performance.now();
+function frame(now){
+  const dt = Math.min((now - lastT)/1000, 0.05);
+  lastT = now;
+  update(dt);
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+})();
+</script>
+</body>
+</html>
